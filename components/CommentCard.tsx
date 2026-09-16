@@ -55,9 +55,20 @@ export default function CommentCard({ comment, selected, onToggle }: Props) {
               {comment.sourceTag}
             </p>
           </div>
-          <span className="shrink-0 text-xs font-medium text-blue-600">
-            {comment.hasOriginal ? "원본 보기" : "원본 없음"}
-          </span>
+          {comment.hasOriginal && comment.permalink ? (
+            <a
+              href={comment.permalink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="shrink-0 text-xs font-medium text-blue-600 hover:underline"
+            >
+              원본 보기
+            </a>
+          ) : (
+            <span className="shrink-0 text-xs font-medium text-blue-600">
+              {comment.hasOriginal ? "원본 보기" : "원본 없음"}
+            </span>
+          )}
         </div>
       </div>
     </div>

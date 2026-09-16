@@ -1,31 +1,94 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import TopNav from "@/components/TopNav";
 import StatusTabs, { TabKey } from "@/components/StatusTabs";
 import FilterBar from "@/components/FilterBar";
 import CommentCard from "@/components/CommentCard";
 import BulkActionBar from "@/components/BulkActionBar";
-import { SAMPLE_COMMENTS } from "@/lib/sample-data";
 import { Category, Comment, CommentStatus, Platform } from "@/lib/types";
 
+interface ConnectionInfo {
+  connected: boolean;
+  pages: { pageId: string; pageName: string; instagramUsername?: string }[];
+}
+
+const ERROR_MESSAGES: Record<string, string> = {
+  not_configured:
+    "Meta 앱 환경 변수가 설정되지 않았어요. .env.local을 확인해주세요 (SETUP_META.md 참고).",
+  invalid_state: "인증 요청이 만료되었거나 위조됐어요. 다시 시도해주세요.",
+  oauth_failed:
+    "Meta 인증에 실패했어요. 앱 설정(리디렉션 URI, 권한)을 확인해주세요.",
+};
+
 export default function CommentManagementPage() {
-  const [comments, setComments] = useState<Comment[]>(SAMPLE_COMMENTS);
-  const [activeTab, setActiveTab] = useState<TabKey>("completed");
-  const [platformFilter, setPlatformFilter] = useState<Platform | "all">(
-    "all"
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [connection, setConnection] = useState<ConnectionInfo>({
+    connected: false,
+    pages: [],
+  });
+  const [banner, setBanner] = useState<{ type: "success" | "error"; text: string } | null>(
+    null
   );
-  const [categoryFilter, setCategoryFilter] = useState<Category | "all">(
-    "all"
-  );
+
+  const [activeTab, setActiveTab] = useState<TabKey>("all");
+  const [platformFilter, setPlatformFilter] = useState<Platform | "all">("all");
+  const [categoryFilter, setCategoryFilter] = useState<Category | "all">("all");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const loadComments = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/comments");
+      const data = await res.json();
+      setComments(data.comments ?? []);
+    } catch (err) {
+      console.error("Failed to load comments", err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadConnection = useCallback(async () => {
+    try {
+      const res = await fetch("/api/connection");
+      const data = await res.json();
+      setConnection({ connected: data.connected, pages: data.pages ?? [] });
+    } catch (err) {
+      console.error("Failed to load connection status", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadComments();
+    loadConnection();
+
+    const params = new URLSearchParams(window.location.search);
+    const metaError = params.get("meta_error");
+    const connected = params.get("connected");
+    if (metaError) {
+      setBanner({
+        type: "error",
+        text: ERROR_MESSAGES[metaError] ?? "Meta 연동 중 오류가 발생했어요.",
+      });
+    } else if (connected) {
+      setBanner({ type: "success", text: "Instagram/Facebook 계정을 연결했어요." });
+    }
+    if (metaError || connected) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, [loadComments, loadConnection]);
+
+  async function handleDisconnect() {
+    await fetch("/api/connection", { method: "DELETE" });
+    await Promise.all([loadConnection(), loadComments()]);
+  }
 
   const filteredByCriteria = useMemo(() => {
     return comments.filter((c) => {
-      if (platformFilter !== "all" && c.platform !== platformFilter)
-        return false;
-      if (categoryFilter !== "all" && c.category !== categoryFilter)
-        return false;
+      if (platformFilter !== "all" && c.platform !== platformFilter) return false;
+      if (categoryFilter !== "all" && c.category !== categoryFilter) return false;
       return true;
     });
   }, [comments, platformFilter, categoryFilter]);
@@ -49,8 +112,7 @@ export default function CommentManagementPage() {
   }, [filteredByCriteria, activeTab]);
 
   const allVisibleSelected =
-    visibleComments.length > 0 &&
-    visibleComments.every((c) => selectedIds.has(c.id));
+    visibleComments.length > 0 && visibleComments.every((c) => selectedIds.has(c.id));
 
   function resetSelection() {
     setSelectedIds(new Set());
@@ -82,29 +144,58 @@ export default function CommentManagementPage() {
 
   function toggleAllVisible() {
     setSelectedIds((prev) => {
-      if (allVisibleSelected) {
-        const next = new Set(prev);
-        visibleComments.forEach((c) => next.delete(c.id));
-        return next;
-      }
       const next = new Set(prev);
-      visibleComments.forEach((c) => next.add(c.id));
+      if (allVisibleSelected) {
+        visibleComments.forEach((c) => next.delete(c.id));
+      } else {
+        visibleComments.forEach((c) => next.add(c.id));
+      }
       return next;
     });
   }
 
-  function handleMove(status: CommentStatus) {
+  // Real (Meta-backed) comments are moderated server-side — hidden/deleted
+  // on the actual Facebook/Instagram comment — in addition to the local
+  // status change; sample rows just update local state. The UI updates
+  // immediately either way, the API call runs alongside it.
+  async function handleMove(targetStatus: CommentStatus) {
+    const ids = Array.from(selectedIds);
     setComments((prev) =>
-      prev.map((c) =>
-        selectedIds.has(c.id) ? { ...c, status } : c
-      )
+      prev.map((c) => (selectedIds.has(c.id) ? { ...c, status: targetStatus } : c))
     );
     resetSelection();
+    try {
+      await fetch("/api/comments/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "move", ids, targetStatus }),
+      });
+    } catch (err) {
+      console.error("Failed to sync move to server", err);
+    }
   }
 
-  function handleDelete() {
-    setComments((prev) => prev.filter((c) => !selectedIds.has(c.id)));
+  async function handleDelete() {
+    const ids = Array.from(selectedIds);
+    if (
+      comments.some((c) => ids.includes(c.id) && c.source === "meta") &&
+      !window.confirm(
+        "선택한 댓글 중 실제 Instagram/Facebook 댓글이 포함되어 있어요. 삭제하면 원본에서도 영구적으로 삭제돼요. 계속할까요?"
+      )
+    ) {
+      return;
+    }
+    setComments((prev) => prev.filter((c) => !ids.includes(c.id)));
     resetSelection();
+    try {
+      await fetch("/api/comments/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "delete", ids }),
+      });
+    } catch (err) {
+      console.error("Failed to sync delete to server", err);
+    }
   }
 
   return (
@@ -112,30 +203,58 @@ export default function CommentManagementPage() {
       <TopNav />
 
       <main className="mx-auto max-w-5xl px-6 py-8">
+        {banner && (
+          <div
+            className={`mb-4 rounded-md px-4 py-2 text-sm ${
+              banner.type === "success"
+                ? "bg-emerald-50 text-emerald-700"
+                : "bg-red-50 text-red-700"
+            }`}
+          >
+            {banner.text}
+          </div>
+        )}
+
         <div className="mb-6 flex items-start justify-between">
           <div>
             <h1 className="text-2xl font-bold text-gray-900">댓글 관리</h1>
             <p className="mt-1 text-sm text-gray-400">
-              마지막 수집 9. 16. 17:00 · 매시간 자동 수집
+              {connection.connected
+                ? `연결됨 · ${connection.pages
+                    .map((p) => p.instagramUsername ?? p.pageName)
+                    .join(", ")}`
+                : "샘플 데이터 표시 중 · 계정을 연결하면 실제 댓글을 가져와요"}
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <button className="rounded-md border border-gray-200 bg-white px-3.5 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50">
-              댓글 연결 설정
-            </button>
-            <button className="rounded-md bg-gray-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-gray-800">
-              새로 가져오기
+            {connection.connected ? (
+              <button
+                onClick={handleDisconnect}
+                className="rounded-md border border-gray-200 bg-white px-3.5 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                연결 해제
+              </button>
+            ) : (
+              <a
+                href="/api/auth/meta"
+                className="rounded-md border border-gray-200 bg-white px-3.5 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                댓글 연결 설정
+              </a>
+            )}
+            <button
+              onClick={loadComments}
+              disabled={loading}
+              className="rounded-md bg-gray-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-gray-800 disabled:opacity-50"
+            >
+              {loading ? "불러오는 중..." : "새로 가져오기"}
             </button>
           </div>
         </div>
 
         <div className="rounded-xl border border-gray-200 bg-white">
           <div className="flex items-center justify-between">
-            <StatusTabs
-              active={activeTab}
-              counts={counts}
-              onChange={handleTabChange}
-            />
+            <StatusTabs active={activeTab} counts={counts} onChange={handleTabChange} />
             <div className="pr-6">
               <FilterBar
                 platform={platformFilter}
@@ -174,7 +293,7 @@ export default function CommentManagementPage() {
           <div>
             {visibleComments.length === 0 ? (
               <div className="px-6 py-16 text-center text-sm text-gray-400">
-                표시할 댓글이 없어요.
+                {loading ? "불러오는 중..." : "표시할 댓글이 없어요."}
               </div>
             ) : (
               visibleComments.map((comment) => (
